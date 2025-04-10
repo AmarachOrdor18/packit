@@ -916,7 +916,7 @@ The first dist-git commit to be synced is '{short_hash}'.
         sync_acls: Optional[bool] = False,
         fast_forward_merge_branches: Optional[set[str]] = None,
         warn_about_koji_build_triggering_bug: bool = False,
-    ) -> PullRequest:
+    ) -> tuple[PullRequest, dict[str, PullRequest]]:
         """Overload for type-checking; return PullRequest if create_pr=True."""
 
     @overload
@@ -971,7 +971,7 @@ The first dist-git commit to be synced is '{short_hash}'.
         sync_acls: Optional[bool] = False,
         fast_forward_merge_branches: Optional[set[str]] = None,
         warn_about_koji_build_triggering_bug: bool = False,
-    ) -> Optional[PullRequest]:
+    ) -> Optional[tuple[PullRequest, dict[str, PullRequest]]]:
         """
         Update given package in dist-git
 
@@ -1009,7 +1009,9 @@ The first dist-git commit to be synced is '{short_hash}'.
                 fast-forward-merged into.
 
         Returns:
-            The created (or existing if one already exists) PullRequest if
+            Tuple of the created (or existing if one already exists) PullRequest and
+             dictionary of branches from fast_forward_merge_branches as keys and
+             PullRequest objects as values if
             create_pr is True, else None.
 
         Raises:
@@ -1122,7 +1124,9 @@ The first dist-git commit to be synced is '{short_hash}'.
 
             # reload spec files as they could have been changed by the action
             self.up.specfile.reload()
-            self.dg.specfile.reload()
+            # downstream spec file doesn't have to exist yet
+            with contextlib.suppress(FileNotFoundError):
+                self.dg.specfile.reload()
 
             # compare versions here because users can mangle with specfile in
             # post_upstream_clone action
@@ -1149,7 +1153,9 @@ The first dist-git commit to be synced is '{short_hash}'.
 
             # reload spec files as they could have been changed by the action
             self.up.specfile.reload()
-            self.dg.specfile.reload()
+            # downstream spec file doesn't have to exist yet
+            with contextlib.suppress(FileNotFoundError):
+                self.dg.specfile.reload()
 
             if create_pr:
                 local_pr_branch = f"{dist_git_branch}-{local_pr_branch_suffix}"
@@ -1207,6 +1213,8 @@ The first dist-git commit to be synced is '{short_hash}'.
             )
 
             pr = None
+            ff_prs = {}
+
             if create_pr:
                 pr_description = self.get_pr_description(
                     upstream_tag=upstream_tag,
@@ -1231,6 +1239,40 @@ The first dist-git commit to be synced is '{short_hash}'.
 
                 if fast_forward_merge_branches:
                     for ff_branch in fast_forward_merge_branches:
+                        logger.info(
+                            f"Syncing branch {ff_branch} defined in `fast_forward_merge_into`",
+                        )
+                        self.dg.refresh_specfile()
+                        self.dg.create_branch(
+                            ff_branch,
+                            base=f"remotes/origin/{ff_branch}",
+                            setup_tracking=True,
+                        )
+                        self.dg.update_branch(ff_branch)
+                        self.dg.switch_branch(ff_branch, force=True)
+
+                        try:
+                            spec_ver = self.dg.get_specfile_version()
+                        except FileNotFoundError:
+                            continue
+
+                        self.dg.switch_branch(local_pr_branch, force=True)
+
+                        if not self.check_version_distance(
+                            version,
+                            spec_ver,
+                            ff_branch,
+                        ):
+                            logger.info(
+                                f"The upstream released version {version} does not match "
+                                f"specfile version {spec_ver} at branch {ff_branch} "
+                                f"using the version_update_mask "
+                                f'"{self.package_config.version_update_mask}".'
+                                "\nYou can change the version_update_mask with an empty string "
+                                "to skip this check.",
+                            )
+                            continue
+
                         pr_title = (
                             title or f"Update {ff_branch} to upstream release {version}"
                         )
@@ -1240,10 +1282,12 @@ The first dist-git commit to be synced is '{short_hash}'.
                             target_branch=ff_branch,
                             repo=self.dg,
                         )
+                        ff_prs[ff_branch] = ff_branch_pr
                         if warn_about_koji_build_triggering_bug:
                             self._warn_about_koji_build_triggering_bug_if_needed(
                                 ff_branch_pr,
                             )
+
                 if warn_about_koji_build_triggering_bug:
                     self._warn_about_koji_build_triggering_bug_if_needed(pr)
             else:
@@ -1262,7 +1306,7 @@ The first dist-git commit to be synced is '{short_hash}'.
             self.dg.local_project.git_repo.git.clean("-xdf")
             self.up.clean_working_dir()
 
-        return pr
+        return pr, ff_prs if create_pr else None
 
     def get_default_commit_description(
         self,
@@ -2311,12 +2355,20 @@ The first dist-git commit to be synced is '{short_hash}'.
         upstream_ref: Optional[str] = None,
         release_suffix: Optional[str] = None,
         base_srpm: Optional[Path] = None,
+        base_nvr: Optional[str] = None,
         comment: Optional[str] = "Submitted through Packit.",
         csmock_args: Optional[str] = None,
     ) -> str:
         """
         Perform a build through OpenScanHub.
         """
+
+        if base_srpm and base_nvr:
+            logger.error(
+                "Either base SRPM or NVR can be specified for differential scans but not both",
+            )
+            return None
+
         # `osh-cli` requires a kerberos ticket.
         self.init_kerberos_ticket()
 
@@ -2334,6 +2386,13 @@ The first dist-git commit to be synced is '{short_hash}'.
                 "--srpm=" + str(srpm_path),
                 "--base-srpm=" + str(base_srpm),
             ]
+        elif base_nvr:
+            cmd = [
+                "osh-cli",
+                "version-diff-build",
+                "--srpm=" + str(srpm_path),
+                "--base-nvr=" + base_nvr,
+            ]
         else:
             cmd = ["osh-cli", "mock-build", str(srpm_path)]
 
@@ -2343,10 +2402,22 @@ The first dist-git commit to be synced is '{short_hash}'.
         if csmock_args:
             cmd.append("--csmock-args=" + shlex.quote(csmock_args))
 
-        cmd.append("--config=" + str(chroot))
+        osh_config = str(chroot)
+
+        if osh_options := self.package_config.osh_options:
+            if analyzer := osh_options.analyzer:
+                cmd.append("--analyzer=" + shlex.quote(analyzer))
+            if profile := osh_options.profile:
+                cmd.append("--profile=" + shlex.quote(profile))
+            if config := osh_options.config:
+                osh_config = shlex.quote(config)
+
+        cmd.append("--config=" + osh_config)
         cmd.append("--nowait")
         cmd.append("--json")
         cmd.append("--comment=" + comment)
+
+        logger.info(f"Full command passed to osh-cli -> {cmd}")
 
         try:
             cmd_result = commands.run_command(cmd, output=True)
